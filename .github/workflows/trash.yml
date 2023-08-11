@@ -3,7 +3,7 @@ name: 'produce trash 🗑️'
 on:
   # Run every hour on the hour
   schedule:
-    - cron: '21 * * * *'
+    - cron: '0 * * * *'
   # Allow manual triggering of the workflow
   workflow_dispatch:
 
