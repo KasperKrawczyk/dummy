@@ -20,6 +20,12 @@ jobs:
           persist-credentials: false  # Use custom credentials for pushing
           fetch-depth: 0  # Fetch all history for all branches and tags
 
+      # Set up Node.js environment
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: 16
+
       # Set up Python environment
       - name: Set up Python 3.x
         uses: actions/setup-python@v2
