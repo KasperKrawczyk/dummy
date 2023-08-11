@@ -12,13 +12,11 @@ messages=[
 	"first commit",
 	"dummy",
 	"updated readme",
-	"pi push",
 	"create readme.md",
 	"fix",
 	"cleanup",
 	"test",
 	"typo",
-	"fuck",
 	"wip",
 	"bump version",
 	"updates"	
