@@ -23,6 +23,6 @@ messages=[
 ]
 
 # I couldn't get the bash for loop to run in the github action, so... here we are.
-for n in range(random.randint(1, 10)):
+for n in range(random.randint(1, 5)):
 	message = q(random.choice(messages))
 	os.system(f'git commit -m "{message}" --allow-empty')
