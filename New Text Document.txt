@@ -1,0 +1,246 @@
+package com.example.metrics;
+
+import io.micronaut.aop.InterceptorBinding;
+import java.lang.annotation.*;
+
+/**
+ * Instruments a method with Micrometer Timer and Counter metrics.
+ * Allows separate metric names for success and failure outcomes.
+ */
+@Documented
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.METHOD})
+@InterceptorBinding
+public @interface MeasuredCall {
+
+    /**
+     * Base metric name (used if successMetric and errorMetric are not set).
+     */
+    String value();
+
+    /**
+     * Metric name to use when the method completes successfully.
+     * If blank, defaults to value().
+     */
+    String successMetric() default "";
+
+    /**
+     * Metric name to use when the method fails (throws or completes exceptionally).
+     * If blank, defaults to value().
+     */
+    String errorMetric() default "";
+
+    /**
+     * Static tags as key/value pairs (must be even-length).
+     */
+    String[] tags() default {};
+
+    /** Whether to publish percentile histograms for the timer. */
+    boolean histogram() default false;
+
+    // ---- Method tagging ----
+    boolean addMethodTag() default true;
+    String methodTagKey() default "method";
+
+    // ---- Exception tagging ----
+    boolean tagExceptionClass() default true;
+    String exceptionTag() default "exception";
+
+    // ---- Context propagation ----
+    boolean propagateContext() default true;
+
+    // ---- Conditional request field extraction ----
+    boolean tagPspCode() default false;
+    String pspCodeKey() default "psp_code";
+}
+
+
+package com.example.metrics;
+
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Tags;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Holds Micrometer tags for the current thread, so nested interceptors can inherit them.
+ */
+public final class MetricsContext {
+
+    private static final ThreadLocal<List<Tag>> CONTEXT = ThreadLocal.withInitial(ArrayList::new);
+
+    private MetricsContext() {}
+
+    public static void push(Tags tags) {
+        CONTEXT.get().addAll(tags.stream().toList());
+    }
+
+    public static Tags current() {
+        List<Tag> list = CONTEXT.get();
+        if (list.isEmpty()) {
+            return Tags.empty();
+        }
+        return Tags.of(list);
+    }
+
+    public static void clear() {
+        CONTEXT.remove();
+    }
+}
+
+package com.example.metrics;
+
+import io.micrometer.core.instrument.*;
+import io.micronaut.aop.*;
+import jakarta.inject.Singleton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.CompletionStage;
+
+@Singleton
+@InterceptorBean(MeasuredCall.class)
+public class MeasuredCallInterceptor implements MethodInterceptor<Object, Object> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MeasuredCallInterceptor.class);
+    private final MeterRegistry registry;
+
+    public MeasuredCallInterceptor(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    @Override
+    public Object intercept(MethodInvocationContext<Object, Object> ctx) {
+        MeasuredCall ann = ctx.getAnnotation(MeasuredCall.class);
+        if (ann == null) {
+            return ctx.proceed();
+        }
+
+        Timer.Sample sample = Timer.start(registry);
+        Tags baseTags = buildBaseTags(ann, ctx);
+
+        if (ann.propagateContext()) {
+            MetricsContext.push(baseTags);
+        }
+
+        try {
+            Object result = ctx.proceed();
+
+            // Async methods
+            if (result instanceof CompletionStage<?>) {
+                ((CompletionStage<?>) result).whenComplete((v, t) -> {
+                    recordOutcome(ann, ctx, sample, baseTags, t);
+                    MetricsContext.clear();
+                });
+                return result;
+            }
+
+            // Sync success
+            recordOutcome(ann, ctx, sample, baseTags, null);
+            return result;
+
+        } catch (Throwable t) {
+            recordOutcome(ann, ctx, sample, baseTags, t);
+            throw t;
+        } finally {
+            if (!(ctx.getReturnType().isAsync())) {
+                MetricsContext.clear();
+            }
+        }
+    }
+
+    // ---- Unified outcome recording ----
+    private void recordOutcome(MeasuredCall ann, MethodInvocationContext<?, ?> ctx,
+                               Timer.Sample sample, Tags baseTags, Throwable error) {
+
+        boolean success = (error == null);
+        String metricName = chooseMetricName(ann, success);
+        Tags tags = buildOutcomeTags(ann, baseTags, success, error);
+
+        // Timer
+        Timer.Builder timer = Timer.builder(metricName)
+                .tags(tags)
+                .publishPercentileHistogram(ann.histogram());
+        sample.stop(timer.register(registry));
+
+        // Counter
+        registry.counter(metricName + ".requests", tags).increment();
+
+        if (!success) {
+            LOG.debug("Recorded error metric for {}: {}", ctx.getMethodName(),
+                      error != null ? error.getClass().getSimpleName() : "(unknown)");
+        }
+    }
+
+    private String chooseMetricName(MeasuredCall ann, boolean success) {
+        if (success && !ann.successMetric().isBlank()) {
+            return ann.successMetric();
+        } else if (!success && !ann.errorMetric().isBlank()) {
+            return ann.errorMetric();
+        } else {
+            return ann.value();
+        }
+    }
+
+    // ---- Tag building ----
+
+    private Tags buildBaseTags(MeasuredCall ann, MethodInvocationContext<?, ?> ctx) {
+        String[] kv = ann.tags();
+        if (kv.length % 2 != 0) kv = Arrays.copyOf(kv, kv.length - 1);
+
+        Tags tags = kv.length == 0 ? Tags.empty() : Tags.of(kv);
+
+        Tags inherited = MetricsContext.current();
+        if (ann.propagateContext() && inherited.iterator().hasNext()) {
+            tags = tags.and(inherited);
+        }
+
+        if (ann.addMethodTag()) {
+            tags = tags.and(ann.methodTagKey(), ctx.getMethodName());
+        }
+
+        if (ann.tagPspCode()) {
+            Object pspCode = extractPspCode(ctx);
+            if (pspCode != null) {
+                tags = tags.and(ann.pspCodeKey(), String.valueOf(pspCode));
+            }
+        }
+
+        return tags;
+    }
+
+    private Tags buildOutcomeTags(MeasuredCall ann, Tags baseTags,
+                                  boolean success, Throwable error) {
+        Tags tags = baseTags;
+        if (!success && ann.tagExceptionClass() && error != null) {
+            tags = tags.and(ann.exceptionTag(), error.getClass().getSimpleName());
+        }
+        return tags;
+    }
+
+    private Object extractPspCode(MethodInvocationContext<?, ?> ctx) {
+        Object[] args = ctx.getParameterValues().values().toArray();
+        if (args.length == 0) return null;
+        Object req = args[0];
+        if (req == null) return null;
+
+        try {
+            Method getter = req.getClass().getMethod("getPspCode");
+            return getter.invoke(req);
+        } catch (NoSuchMethodException ignored) {
+            try {
+                Field field = req.getClass().getDeclaredField("pspCode");
+                field.setAccessible(true);
+                return field.get(req);
+            } catch (Exception ex) {
+                return null;
+            }
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+}
+
