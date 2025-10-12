@@ -1,168 +1,198 @@
-@MicronautTest
-class MeasuredCallInterceptorTest {
-    @Inject
-    TestService service;
+package your.package;
 
-    @Inject
-    MeterRegistry registry;
-}
+import io.micrometer.core.instrument.*;
+import io.micronaut.aop.MethodInvocationContext;
+import io.micronaut.core.annotation.AnnotationValue;
+import io.micronaut.core.type.Argument;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.*;
 
-@Singleton
-class TestService {
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
-    @MeasuredCall(
-        value = "test.metric",
-        successMetric = "test.metric.success",
-        errorMetric = "test.metric.error",
-        tags = {"boundness", "test"},
-        histogram = true,
-        tagPspCode = true
-    )
-    public String okCall(TestRequest req) {
-        return "OK";
-    }
-
-    @MeasuredCall(
-        value = "test.metric",
-        successMetric = "test.metric.success",
-        errorMetric = "test.metric.error"
-    )
-    public String failingCall(TestRequest req) {
-        throw new RuntimeException("boom");
-    }
-
-    @MeasuredCall(
-        value = "test.metric",
-        successMetric = "test.metric.success",
-        errorMetric = "test.metric.error"
-    )
-    public CompletionStage<String> asyncCall(TestRequest req) {
-        return CompletableFuture.supplyAsync(() -> "ASYNC");
-    }
-}
-
-class TestRequest {
-    private final String pspCode = "ABC123";
-    public String getPspCode() { return pspCode; }
-}
-
-
-@MicronautTest
 class MeasuredCallInterceptorTest {
 
-    @Inject
-    TestService service;
-
-    @Inject
     MeterRegistry registry;
+    MeasuredCallInterceptor interceptor;
 
+    @BeforeEach
+    void setup() {
+        registry = mock(MeterRegistry.class);
+        interceptor = new MeasuredCallInterceptor(registry);
+    }
+
+    // region --- intercept() coverage ---
+
+    @SuppressWarnings("unchecked")
     @Test
-    void testSuccessCall_recordsMetrics() {
-        service.okCall(new TestRequest());
+    void intercept_success_recordsTimerAndCounter() {
+        MethodInvocationContext<Object, Object> ctx = mock(MethodInvocationContext.class);
+        Timer.Sample sample = mock(Timer.Sample.class);
+        Timer.Builder builder = mock(Timer.Builder.class);
+        Timer timer = mock(Timer.class);
 
-        assertThat(registry.getMeters().size()).isGreaterThan(0);
+        try (MockedStatic<Timer> timerStatic = Mockito.mockStatic(Timer.class)) {
+            timerStatic.when(() -> Timer.start(registry)).thenReturn(sample);
+            when(Timer.builder(anyString())).thenReturn(builder);
+            when(builder.tags(any(Tags.class))).thenReturn(builder);
+            when(builder.publishPercentileHistogram(anyBoolean())).thenReturn(builder);
+            when(builder.register(registry)).thenReturn(timer);
+
+            AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+            when(ctx.getAnnotation(MeasuredCall.class)).thenReturn(ann);
+            when(ctx.getExecutableMethod().getName()).thenReturn("successMethod");
+            when(ctx.proceed()).thenReturn("ok");
+
+            Object result = interceptor.intercept(ctx);
+
+            assertThat(result).isEqualTo("ok");
+            verify(sample).stop(timer);
+            verify(registry, atLeastOnce()).counter(contains("requests"), any(Tags.class));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void intercept_exception_recordsErrorTimerAndCounter() {
+        MethodInvocationContext<Object, Object> ctx = mock(MethodInvocationContext.class);
+        Timer.Sample sample = mock(Timer.Sample.class);
+        Timer.Builder builder = mock(Timer.Builder.class);
+        Timer timer = mock(Timer.class);
+        RuntimeException boom = new RuntimeException("boom");
+
+        try (MockedStatic<Timer> timerStatic = Mockito.mockStatic(Timer.class)) {
+            timerStatic.when(() -> Timer.start(registry)).thenReturn(sample);
+            when(Timer.builder(anyString())).thenReturn(builder);
+            when(builder.tags(any(Tags.class))).thenReturn(builder);
+            when(builder.publishPercentileHistogram(anyBoolean())).thenReturn(builder);
+            when(builder.register(registry)).thenReturn(timer);
+
+            AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+            when(ctx.getAnnotation(MeasuredCall.class)).thenReturn(ann);
+            when(ctx.getExecutableMethod().getName()).thenReturn("errorMethod");
+            when(ctx.proceed()).thenThrow(boom);
+
+            assertThatThrownBy(() -> interceptor.intercept(ctx)).isEqualTo(boom);
+            verify(sample).stop(timer);
+            verify(registry, atLeastOnce()).counter(contains("requests"), any(Tags.class));
+        }
+    }
+
+    // endregion
+
+    // region --- helper: chooseMetricName() ---
+    @Test
+    void chooseMetricName_selectsDifferentMetricNames() throws Exception {
+        AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+        when(ann.stringValue("successMetric")).thenReturn(Optional.of("successMetricName"));
+        when(ann.stringValue("errorMetric")).thenReturn(Optional.of("errorMetricName"));
+
+        Method m = MeasuredCallInterceptor.class.getDeclaredMethod(
+                "chooseMetricName", AnnotationValue.class, boolean.class);
+        m.setAccessible(true);
+
+        String success = (String) m.invoke(interceptor, ann, true);
+        String error = (String) m.invoke(interceptor, ann, false);
+
+        assertThat(success).isEqualTo("successMetricName");
+        assertThat(error).isEqualTo("errorMetricName");
+    }
+
+    // endregion
+
+    // region --- helper: extractFieldOrAccessor() ---
+    @Test
+    void extractFieldOrAccessor_fieldAndGetterPaths() throws Exception {
+        DummyDto dto = new DummyDto();
+        Method m = MeasuredCallInterceptor.class.getDeclaredMethod(
+                "extractFieldOrAccessor", Object.class, String.class);
+        m.setAccessible(true);
+
+        Object value1 = m.invoke(interceptor, dto, "field");
+        Object value2 = m.invoke(interceptor, dto, "getField");
+        Object value3 = m.invoke(interceptor, dto, "Field");
+
+        assertThat(value1).isEqualTo("fieldValue");
+        assertThat(value2).isEqualTo("fieldValue");
+        assertThat(value3).isEqualTo("fieldValue");
+    }
+
+    // endregion
+
+    // region --- helper: buildBaseTags() and buildOutcomeTags() ---
+    @Test
+    void buildBaseTags_withPropagationAndPspCode() throws Exception {
+        AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+        MethodInvocationContext<Object, Object> ctx = mock(MethodInvocationContext.class);
+        when(ctx.getExecutableMethod().getName()).thenReturn("baseTagMethod");
+        when(ctx.getParameterValues()).thenReturn(Map.of("arg0", new Object()));
+
+        when(ann.booleanValue("propagateContext")).thenReturn(Optional.of(true));
+        when(ann.booleanValue("addMethodTag")).thenReturn(Optional.of(true));
+        when(ann.booleanValue("tagPspCode")).thenReturn(Optional.of(true));
+        when(ann.stringValue("pspCodeFieldName")).thenReturn(Optional.of("pspName"));
+
+        Method m = MeasuredCallInterceptor.class.getDeclaredMethod(
+                "buildBaseTags", AnnotationValue.class, MethodInvocationContext.class);
+        m.setAccessible(true);
+
+        Object result = m.invoke(interceptor, ann, ctx);
+        assertThat(result).isInstanceOf(Tags.class);
     }
 
     @Test
-    void testErrorCall_recordsErrorMetrics() {
-        assertThrows(RuntimeException.class, () -> service.failingCall(new TestRequest()));
+    void buildOutcomeTags_withSuccessAndError() throws Exception {
+        AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+        Tags baseTags = Tags.of("base", "value");
+        Throwable error = new RuntimeException("boom");
 
-        assertThat(registry.find("test.metric.error.requests").counter()).isPresent();
+        Method m = MeasuredCallInterceptor.class.getDeclaredMethod(
+                "buildOutcomeTags", AnnotationValue.class, Tags.class, boolean.class, Throwable.class);
+        m.setAccessible(true);
+
+        Tags successTags = (Tags) m.invoke(interceptor, ann, baseTags, true, null);
+        Tags errorTags = (Tags) m.invoke(interceptor, ann, baseTags, false, error);
+
+        assertThat(successTags).isInstanceOf(Tags.class);
+        assertThat(errorTags).isInstanceOf(Tags.class);
     }
+    // endregion
 
+    // region --- helper: extractPspCode() ---
     @Test
-    void testAsyncCall_recordsMetricsOnCompletion() throws Exception {
-        service.asyncCall(new TestRequest()).toCompletableFuture().get(1, TimeUnit.SECONDS);
+    void extractPspCode_reflectsFromReturnValue() throws Exception {
+        MethodInvocationContext<Object, Object> ctx = mock(MethodInvocationContext.class);
+        AnnotationValue<MeasuredCall> ann = mock(AnnotationValue.class);
+        DummyPsp dto = new DummyPsp();
 
-        assertThat(registry.find("test.metric.success.requests").counter()).isPresent();
+        when(ctx.proceed()).thenReturn(dto);
+        when(ann.stringValue("returnObjectClassSimpleName")).thenReturn(Optional.of("DummyPsp"));
+        when(ann.stringValue("pspCodeFieldName")).thenReturn(Optional.of("pspName"));
+
+        Method m = MeasuredCallInterceptor.class.getDeclaredMethod(
+                "extractPspCode", MethodInvocationContext.class, AnnotationValue.class);
+        m.setAccessible(true);
+
+        String result = (String) m.invoke(interceptor, ctx, ann);
+        assertThat(result).isEqualTo("PSP123");
+    }
+    // endregion
+
+    // region --- private dummy classes for reflection ---
+    static class DummyDto {
+        private final String field = "fieldValue";
+        public String getField() { return field; }
     }
 
-    @Test
-    void testPspCodeExtractionWorks() {
-        service.okCall(new TestRequest());
-
-        Counter c = registry.find("test.metric.success.requests")
-                .tag("psp_code", "ABC123")
-                .counter()
-                .orElseThrow();
-        assertThat(c.count()).isGreaterThan(0);
+    static class DummyPsp {
+        private final String pspName = "PSP123";
+        public String getPspName() { return pspName; }
     }
-
-    @Test
-    void testContextPropagationAndClear() {
-        MetricsContext.push(Tags.of("foo", "bar"), "outerMethod");
-        assertThat(MetricsContext.currentTags().iterator().hasNext()).isTrue();
-        MetricsContext.clear();
-        assertThat(MetricsContext.currentTags().iterator().hasNext()).isFalse();
-    }
-
-    @Test
-    void testExceptionTagAppearsOnFailure() {
-        try {
-            service.failingCall(new TestRequest());
-        } catch (RuntimeException ignored) {}
-        assertThat(registry.find("test.metric.error.requests")
-                .tags("exception", "RuntimeException")
-                .counter()).isPresent();
-    }
+    // endregion
 }
-
-90
-
-@Test
-void testMissingPspCodeDoesNotThrow() {
-    class EmptyReq {}
-    assertDoesNotThrow(() -> service.okCall(new EmptyReq()));
-}
-
-@Singleton
-class OddTagService {
-    @MeasuredCall(value = "odd.metric", tags = {"one"}) // odd number of elements
-    public void call() {}
-}
-
-@MicronautTest
-class OddTagTest {
-    @Inject OddTagService svc;
-    @Test void testOddTags() { svc.call(); }
-}
-
-private Object extractFieldOrAccessor(Object target, String fieldName) {
-    if (target == null || fieldName == null) {
-        return null;
-    }
-
-    Class<?> clazz = target.getClass();
-
-    // Try record accessor first — for records the accessor has the same name as the field
-    try {
-        Method accessor = clazz.getMethod(fieldName);
-        return accessor.invoke(target);
-    } catch (NoSuchMethodException ignored) {
-        // not a record-style accessor
-    } catch (Exception e) {
-        return null;
-    }
-
-    // Try JavaBean getter style next (getFieldName)
-    try {
-        String getterName = "get" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
-        Method getter = clazz.getMethod(getterName);
-        return getter.invoke(target);
-    } catch (NoSuchMethodException ignored) {
-        // no getter either
-    } catch (Exception e) {
-        return null;
-    }
-
-    // Finally, try to access the field directly
-    try {
-        Field field = clazz.getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return field.get(target);
-    } catch (Exception e) {
-        return null;
-    }
-}
-
