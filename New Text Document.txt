@@ -128,3 +128,41 @@ class OddTagTest {
     @Test void testOddTags() { svc.call(); }
 }
 
+private Object extractFieldOrAccessor(Object target, String fieldName) {
+    if (target == null || fieldName == null) {
+        return null;
+    }
+
+    Class<?> clazz = target.getClass();
+
+    // Try record accessor first — for records the accessor has the same name as the field
+    try {
+        Method accessor = clazz.getMethod(fieldName);
+        return accessor.invoke(target);
+    } catch (NoSuchMethodException ignored) {
+        // not a record-style accessor
+    } catch (Exception e) {
+        return null;
+    }
+
+    // Try JavaBean getter style next (getFieldName)
+    try {
+        String getterName = "get" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+        Method getter = clazz.getMethod(getterName);
+        return getter.invoke(target);
+    } catch (NoSuchMethodException ignored) {
+        // no getter either
+    } catch (Exception e) {
+        return null;
+    }
+
+    // Finally, try to access the field directly
+    try {
+        Field field = clazz.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(target);
+    } catch (Exception e) {
+        return null;
+    }
+}
+
